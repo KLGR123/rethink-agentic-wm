@@ -1,0 +1,5 @@
+# Agent loop registration for WebShop GRPO training.
+# Referenced via actor_rollout_ref.rollout.agent.agent_loop_config_path
+
+- name: webshop_agent
+  _target_: verl_webshop.agent_loop.WebShopAgentLoop
