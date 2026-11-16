@@ -20,7 +20,13 @@ OBS_TEMPLATE = """\
 
 Available actions: {available_actions}"""
 
-_ACTION_RE = re.compile(r"Action:\s*(search|click)\[(.+?)\]", re.IGNORECASE)
+_ACTION_RE = re.compile(
+    # The "Action:" prefix is requested by the system prompt but small models
+    # routinely omit it, so it must be optional. The closing bracket is also
+    # frequently mistyped as ")" (e.g. "...price:370.00 USD)"); accept both.
+    r"(?:Action\s*:\s*)?(search|click)\s*[\[\(](.*?)[\]\)]",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 def build_system_message(instruction: str) -> dict:

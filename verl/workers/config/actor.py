@@ -35,6 +35,7 @@ from .optimizer import OptimizerConfig
 __all__ = [
     "PolicyLossConfig",
     "RouterReplayConfig",
+    "GradAlignmentConfig",
     "ActorConfig",
     "FSDPActorConfig",
     "McoreActorConfig",
@@ -99,6 +100,16 @@ class PolicyLossConfig(BaseConfig):
     ppo_kl_coef: float = 0.1
     dro_beta: Optional[float] = None
     rollout_correction: RolloutCorrectionConfig = field(default_factory=RolloutCorrectionConfig)
+
+
+@dataclass
+class GradAlignmentConfig(BaseConfig):
+    """Optional fixed-weight online comparison of actor and observation losses."""
+
+    enable: bool = False
+    interval: int = 50
+    output_dir: Optional[str] = None
+    wm_reduction: str = "turn-mean"
 
 
 @dataclass
@@ -191,6 +202,7 @@ class ActorConfig(BaseConfig):
     # global_batch_size: global batch size
     global_batch_info: dict = field(default_factory=dict)
     qat: QATConfig = field(default_factory=QATConfig)
+    grad_alignment: GradAlignmentConfig = field(default_factory=GradAlignmentConfig)
 
     def __post_init__(self):
         """Validate actor configuration parameters."""

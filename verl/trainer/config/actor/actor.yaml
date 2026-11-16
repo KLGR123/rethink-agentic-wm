@@ -350,3 +350,18 @@ qat:
 
   # Path to vLLM quantization config JSON file
   quantization_config_path: null
+
+# Online actor / observation gradient alignment (no full-gradient dumps).
+grad_alignment:
+
+  # Two extra backwards at fixed weights before the selected actor updates.
+  enable: false
+
+  # Probe step 1 and every N training steps, independent of checkpoint saving.
+  interval: 50
+
+  # Small per-step CSV and metadata files.
+  output_dir: null
+
+  # Equal observation-turn weight, or a global mean over observation tokens.
+  wm_reduction: turn-mean

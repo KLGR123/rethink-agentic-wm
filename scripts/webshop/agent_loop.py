@@ -6,26 +6,62 @@ returning an AgentLoopOutput with reward_score set to the final WebShop reward,
 which bypasses the external RewardManager entirely.
 """
 
+import asyncio
 import logging
 import os
 from typing import Any
 from uuid import uuid4
 
-from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput, AgentLoopMetrics, register
+from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopMetrics, AgentLoopOutput, register
+from verl.experimental.agent_loop.episode_utils import merge_generation_metadata
+from verl.experimental.grad_alignment.observations import (
+    finalize_observation_targets,
+    merge_context_with_observations,
+    merge_observation_ids,
+)
 from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
 from verl.workers.rollout.replica import TokenOutput
-
-from verl_webshop.env_client import EnvClient
-from verl_webshop.prompts import (
-    build_system_message,
+from scripts.webshop.env_client import EnvClient
+from scripts.webshop.prompts import (
     build_obs_user_message,
-    parse_action,
+    build_system_message,
     format_action,
+    parse_action,
 )
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+# An env slot is held for an entire episode (reset -> steps -> release), not
+# just for one HTTP call. Without a per-worker cap, every sample on a worker
+# opens its episode at once: train_batch_size * n episodes contend for
+# WEBSHOP_NUM_ENVS slots, most /reset calls sit in the server's idle queue past
+# the client timeout, and the abandoned handlers leak slots until the TTL.
+# Keep episodes in flight <= pool size. Must match --num-envs of the server.
+_ENV_SERVER_SIZE = int(os.getenv("WEBSHOP_NUM_ENVS", "96"))
+_EPISODE_LIMIT_OVERRIDE = int(os.getenv("WEBSHOP_MAX_CONCURRENT_EPISODES", "0"))
+_EPISODE_SEM: asyncio.Semaphore | None = None
+
+
+def _episode_semaphore(limit: int) -> asyncio.Semaphore:
+    """Per-process semaphore shared by every episode on this worker.
+
+    AgentLoopBase instances are created per sample, so the limit cannot live on
+    the instance. Created on first use so it binds to the actor's running loop.
+    """
+
+    global _EPISODE_SEM
+    if _EPISODE_SEM is None:
+        _EPISODE_SEM = asyncio.Semaphore(limit)
+        logger.warning(
+            "WebShop agent: capping episodes in flight at %d per worker (%s).",
+            limit,
+            "WEBSHOP_MAX_CONCURRENT_EPISODES"
+            if _EPISODE_LIMIT_OVERRIDE
+            else f"WEBSHOP_NUM_ENVS={_ENV_SERVER_SIZE} / workers",
+        )
+    return _EPISODE_SEM
 
 
 @register("webshop_agent")
@@ -47,18 +83,36 @@ class WebShopAgentLoop(AgentLoopBase):
         super().__init__(*args, **kwargs)
         self.response_length = self.rollout_config.response_length
         self.max_turns: int = 15
-        self._client = EnvClient(base_url="http://127.0.0.1:8000")
+        num_workers = max(1, int(self.rollout_config.agent.num_workers))
+        limit = _EPISODE_LIMIT_OVERRIDE or max(1, _ENV_SERVER_SIZE // num_workers)
+        self._episode_sem = _episode_semaphore(limit)
+        self._client = EnvClient(base_url=os.getenv("WEBSHOP_ENV_URL", "http://127.0.0.1:8000"))
 
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], priority: int = 0, **kwargs) -> AgentLoopOutput:
+        # Hold a slot for the whole episode, not just the reset call.
+        async with self._episode_sem:
+            return await self._run_episode(sampling_params, priority, **kwargs)
+
+    async def _run_episode(self, sampling_params: dict[str, Any], priority: int = 0, **kwargs) -> AgentLoopOutput:
         priority = int(priority)
         extra_info = kwargs.get("extra_info", {})
         goal_idx: int = int(extra_info.get("goal_idx", 0))
+        # The dataloader step this sample belongs to. Used as a fallback for the
+        # version stamp below when the rollout server has not reported one yet.
+        dataloader_steps = int(kwargs.get("global_steps", -1))
 
         metrics: dict = {}
         env_session: str | None = None
         reward_score: float = 0.0
         turn_count: int = 0
+        wm_terminal = None
+        track_wm = self.config.actor_rollout_ref.actor.get("grad_alignment", {}).get("enable", False)
+        # Merged TokenOutput.extra_fields across turns. The trainer reads
+        # min_global_steps/max_global_steps from here for off-policy staleness;
+        # dropping them makes the tag None and _compute_metrics raises.
+        gen_extra_fields: dict[str, Any] = {}
+        last_output: TokenOutput | None = None
 
         try:
             # 1. Allocate an env slot and get the first observation
@@ -83,6 +137,9 @@ class WebShopAgentLoop(AgentLoopBase):
             runtime_token_ids = list(prompt_ids)
             response_mask: list[int] = []
             response_logprobs: list[float] | None = []
+            # Positive IDs distinguish post-action observation turns. Initial
+            # context, generated actions and template delimiters have ID zero.
+            observation_ids: list[int] = [0] * len(prompt_ids)
             done = False
 
             # 4. Action loop
@@ -103,6 +160,8 @@ class WebShopAgentLoop(AgentLoopBase):
                     )
 
                 # 4b. Merge generated tokens; response_mask = 1 for these tokens
+                last_output = output
+                merge_generation_metadata(gen_extra_fields, output.extra_fields, dataloader_steps)
                 merge_result, response_mask, response_logprobs = await self.ct_merge_assistant_token(
                     runtime_token_ids,
                     output.token_ids,
@@ -111,6 +170,9 @@ class WebShopAgentLoop(AgentLoopBase):
                     assistant_logprobs=output.log_probs if output.log_probs else None,
                 )
                 runtime_token_ids = merge_result.token_ids
+                # Assistant tokens are never observations. The mask must be extended with
+                # the SAME edit the merge applied, boundary tokens included.
+                observation_ids = merge_observation_ids(merge_result, observation_ids)
                 turn_count += 1
 
                 # 4c. Parse the action from the generated text
@@ -118,10 +180,15 @@ class WebShopAgentLoop(AgentLoopBase):
                 parsed = parse_action(generated_text)
 
                 if parsed is None:
-                    # No valid action found — take a null step so the episode
-                    # progresses and gets 0 reward rather than hanging
-                    print("No Valid Action Found in Generated Text:", generated_text)
-                    action_str = "click[back to search]"
+                    # No valid action found. Previously this fell back to
+                    # "click[back to search]", which on most pages is not a
+                    # clickable: WebShop then no-ops, the observation repeats
+                    # and the episode burns all remaining turns for zero
+                    # reward. End the episode at 0 instead.
+                    logger.warning("No valid action parsed; ending episode: %r", generated_text[-200:])
+                    reward_score = 0.0
+                    done = True
+                    break
                 else:
                     action_name, action_arg = parsed
                     action_str = format_action(action_name, action_arg)
@@ -135,26 +202,39 @@ class WebShopAgentLoop(AgentLoopBase):
                 done = bool(step_data["done"])
                 available_actions = step_data["available_actions"]
 
-                if done:
+                if done and not track_wm:
                     break
 
-                # 4e. Append observation as a user turn (response_mask = 0)
-                prev_messages = list(messages)
-                messages.append(build_obs_user_message(obs, available_actions))
-
-                merge_result, response_mask, response_logprobs = await self.ct_merge_context_msg(
-                    prev_messages,
+                # Merge once. Terminal observations belong only to the diagnostic
+                # sequence; commit nonterminal observations to the actor context.
+                next_messages = messages + [build_obs_user_message(obs, available_actions)]
+                merge, next_mask, next_logprobs, next_ids = await merge_context_with_observations(
+                    self,
                     messages,
+                    next_messages,
                     runtime_token_ids,
                     response_mask,
+                    observation_ids,
                     response_logprobs,
                 )
-                runtime_token_ids = merge_result.token_ids
+                if done:
+                    wm_terminal = (merge.token_ids, next_ids)
+                    break
+                messages = next_messages
+                runtime_token_ids = merge.token_ids
+                response_mask, response_logprobs, observation_ids = next_mask, next_logprobs, next_ids
 
         finally:
             if env_session is not None:
                 await self._client.release(env_session)
             await self._client.close()
+
+        # Guarantee the version stamps exist even if no generation completed
+        # (e.g. an immediate parse failure): the V1 trainer casts these tags to
+        # int and raises on None.
+        fallback = dataloader_steps if dataloader_steps >= 0 else 0
+        gen_extra_fields.setdefault("min_global_steps", fallback)
+        gen_extra_fields.setdefault("max_global_steps", fallback)
 
         # 5. Split final token sequence into prompt and response
         total_response_len = len(response_mask)
@@ -167,18 +247,34 @@ class WebShopAgentLoop(AgentLoopBase):
         if response_logprobs:
             response_logprobs = response_logprobs[: self.response_length]
 
+        wm_tokens = wm_ids = None
+        if track_wm:
+            wm_tokens, wm_ids = finalize_observation_targets(
+                runtime_token_ids,
+                observation_ids,
+                len(prompt_ids_final) + self.response_length,
+                wm_terminal,
+            )
+
         return AgentLoopOutput(
             prompt_ids=list(prompt_ids_final),
             response_ids=list(response_ids_final),
             response_mask=list(response_mask),
             response_logprobs=list(response_logprobs) if response_logprobs else None,
+            wm_input_ids=wm_tokens,
+            wm_obs_ids=wm_ids,
             reward_score=reward_score,
-            num_turns=turn_count * 2 + 1, # system + user assistant pairs
+            num_turns=turn_count * 2 + 1,  # system + user assistant pairs
             metrics=AgentLoopMetrics(
                 generate_sequences=metrics.get("generate_sequences", 0.0),
-                num_preempted=int(output.num_preempted) if "output" in dir() and output.num_preempted is not None else -1,
+                num_preempted=(
+                    int(last_output.num_preempted)
+                    if last_output is not None and last_output.num_preempted is not None
+                    else -1
+                ),
             ),
             extra_fields={
+                **gen_extra_fields,
                 "turn_scores": [],
                 "tool_rewards": [],
                 "num_env_turns": turn_count,

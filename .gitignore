@@ -133,3 +133,5 @@ outputs
 
 tensorboards/
 datasets/
+
+.codex/

@@ -111,6 +111,11 @@ def construct_minimal_padding_template(
     if teacher_logprobs is not None:
         template_sample["teacher_logprobs"] = teacher_logprobs.new_zeros((sequence_length, *teacher_logprobs.shape[1:]))
 
+    # Synthetic DP rows contribute to neither objective.
+    if "wm_input_ids" in template_sample:
+        template_sample["wm_input_ids"] = input_ids.clone()
+        template_sample["wm_obs_ids"] = torch.zeros_like(input_ids)
+
     # Update the fields and remove redundant parts
     template_sample.update(
         prompts=prompts,

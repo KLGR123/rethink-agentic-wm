@@ -113,6 +113,10 @@ class AgentLoopOutput(BaseModel):
     mm_processor_output: Optional[list[dict[str, Any]]] = None
     """SGLang video payload (see AgentLoopBase.build_sglang_video_payload); reused by the teacher
     (OPD) path so an SGLang teacher receives the video instead of raw frames. None otherwise."""
+    wm_input_ids: Optional[list[int]] = None
+    """Diagnostic-only text sequence, optionally including the terminal observation."""
+    wm_obs_ids: Optional[list[int]] = None
+    """Positive turn IDs on observation content; zero on initial prompt/actions/template."""
 
     def as_dict(self) -> dict[str, Any]:
         """Convert agent loop output to a dictionary."""
@@ -146,6 +150,13 @@ class AgentLoopOutput(BaseModel):
             rm_scores = torch.zeros_like(output["response_mask"], dtype=torch.float32)
             rm_scores[-1] = reward_score
             output["rm_scores"] = rm_scores
+
+        wm_tokens, wm_ids = output.pop("wm_input_ids", None), output.pop("wm_obs_ids", None)
+        if wm_tokens is not None:
+            if wm_ids is None or len(wm_tokens) != len(wm_ids):
+                raise ValueError("wm_input_ids and wm_obs_ids must have equal lengths")
+            output["wm_input_ids"] = torch.tensor(wm_tokens, dtype=torch.int64)
+            output["wm_obs_ids"] = torch.tensor(wm_ids, dtype=torch.int64)
 
         # Mutating a default dict does not add the field to Pydantic's fields-set,
         # so model_dump(exclude_unset=True) can omit populated extra fields.

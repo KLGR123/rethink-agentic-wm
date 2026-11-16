@@ -200,6 +200,10 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             field["input_ids"] = input_ids
             field["position_ids"] = position_ids
             field["multi_modal_inputs"] = multi_modal_inputs
+            if self.config.actor_rollout_ref.actor.get("grad_alignment", {}).get("enable", False):
+                # Uniform schema for a mixture of agent loops within the same run.
+                field.setdefault("wm_input_ids", input_ids)
+                field.setdefault("wm_obs_ids", torch.zeros_like(input_ids))
             fields.append(field)
             prompt_len, response_len = field["prompts"].size(0), field["responses"].size(0)
             tags.append(

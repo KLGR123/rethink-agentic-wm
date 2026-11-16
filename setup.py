@@ -93,6 +93,9 @@ setup(
     install_requires=install_requires,
     extras_require=extras_require,
     package_data={
+        "scripts.alfworld": ["*.sh", "*.yaml"],
+        "scripts.sciworld": ["*.sh", "*.yaml"],
+        "scripts.webshop": ["*.sh", "*.yaml"],
         "": ["version/*"],
         "verl": [
             "trainer/config/*.yaml",

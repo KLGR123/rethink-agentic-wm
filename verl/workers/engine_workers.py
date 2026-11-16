@@ -257,6 +257,8 @@ class TrainingWorker(Worker, DistProfilerExtension):
         epochs = tu.pop(data, key="epochs", default=1)
         seed = tu.pop(data, key="seed", default=42)
         dataloader_kwargs = tu.pop(data, key="dataloader_kwargs", default={})
+        alignment = tu.pop(data, key="grad_alignment", default=None)
+        wm_inputs = {key: data.pop(key, None) for key in ("wm_input_ids", "wm_obs_ids")}
 
         assert mini_batch_size is not None or num_mini_batch is not None
 
@@ -282,6 +284,16 @@ class TrainingWorker(Worker, DistProfilerExtension):
             self.engine.train_mode(disable_auto_offload=disable_auto_offload),
             Timer(name="train_batch", logger=None),
         ):
+            alignment_metrics = {}
+            if alignment:
+                from verl.experimental.grad_alignment.probe import run_probe
+
+                if any(value is None for value in wm_inputs.values()):
+                    raise ValueError("Agent loop did not provide observation targets for the online probe")
+                self._inject_engine_defaults(data)
+                alignment_metrics = run_probe(self.engine, data, wm_inputs, self.loss_fn, alignment)
+            del wm_inputs
+
             # update
             output_lst = []
             total_num_iterations = data.shape[0] // mini_batch_size_per_gpu * epochs
@@ -333,10 +345,32 @@ class TrainingWorker(Worker, DistProfilerExtension):
                             )
                     append_to_dict(metrics, output)
 
+                metrics.update(alignment_metrics)
                 output = tu.get_tensordict(tensor_dict={}, non_tensor_dict={"metrics": metrics}).cpu()
             else:
                 output = None
         return output
+
+    def _inject_engine_defaults(self, data: TensorDict, *, forward_only: bool = False) -> None:
+        """Fill engine-level knobs the forward pass reads, unless the caller set them."""
+        default_keys = dict(
+            use_remove_padding=self.model_config.get("use_remove_padding", False),
+            use_dynamic_bsz=self.engine_config.use_dynamic_bsz,
+            max_token_len_per_gpu=(
+                self.engine_config.infer_max_token_len_per_gpu
+                if forward_only
+                else self.engine_config.max_token_len_per_gpu
+            ),
+            micro_batch_size_per_gpu=(
+                self.engine_config.infer_micro_batch_size_per_gpu
+                if forward_only
+                else self.engine_config.micro_batch_size_per_gpu
+            ),
+            use_fused_kernels=self.engine_config.use_fused_kernels,
+        )
+        for key, val in default_keys.items():
+            if key not in data.keys():
+                tu.assign_non_tensor(data, **{key: val})
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="train"), blocking=False)
     @DistProfiler.annotate(color="red", role="train_batch")
@@ -349,17 +383,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
         images_seqlens = tu.get(data, key="images_seqlens", default=None)
 
         # inject engineering parameters if not specified
-        default_keys = dict(
-            use_remove_padding=self.model_config.get("use_remove_padding", False),
-            use_dynamic_bsz=self.engine_config.use_dynamic_bsz,
-            max_token_len_per_gpu=self.engine_config.max_token_len_per_gpu,
-            micro_batch_size_per_gpu=self.engine_config.micro_batch_size_per_gpu,
-            use_fused_kernels=self.engine_config.use_fused_kernels,
-        )
-
-        for key, val in default_keys.items():
-            if key not in data.keys():
-                tu.assign_non_tensor(data, **{key: val})
+        self._inject_engine_defaults(data)
 
         with (
             self.engine.train_mode(disable_auto_offload=disable_auto_offload),
@@ -403,17 +427,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
         no_lora_adapter = tu.pop(data, key="no_lora_adapter", default=False)
         images_seqlens = tu.get(data, key="images_seqlens", default=None)
 
-        default_keys = dict(
-            use_remove_padding=self.model_config.get("use_remove_padding", False),
-            use_dynamic_bsz=self.engine_config.use_dynamic_bsz,
-            max_token_len_per_gpu=self.engine_config.infer_max_token_len_per_gpu,
-            micro_batch_size_per_gpu=self.engine_config.infer_micro_batch_size_per_gpu,
-            use_fused_kernels=self.engine_config.use_fused_kernels,
-        )
-
-        for key, val in default_keys.items():
-            if key not in data.keys():
-                tu.assign_non_tensor(data, **{key: val})
+        self._inject_engine_defaults(data, forward_only=True)
 
         # for sft training, we need to compute loss in eval
         loss_function = self.loss_fn if compute_loss else None

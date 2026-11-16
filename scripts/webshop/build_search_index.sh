@@ -4,6 +4,7 @@
 # product file. Run from the rethink-agentic-wm repo root.
 
 set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 
 WEBSHOP_ENV="/fs_mol/liujiarun/envs/webshop"
 WEBSHOP_PYTHON="${WEBSHOP_ENV}/bin/python"

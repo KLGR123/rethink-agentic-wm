@@ -1,0 +1,5 @@
+# Agent loop registration for ScienceWorld GRPO training.
+# Referenced via actor_rollout_ref.rollout.agent.agent_loop_config_path
+
+- name: sciworld_agent
+  _target_: scripts.sciworld.agent_loop.ScienceWorldAgentLoop

@@ -18,7 +18,7 @@ def load_goals(webshop_path: str, file_path: str = "") -> list[dict]:
     """Instantiate a minimal WebAgentTextEnv and extract all goals + instructions.
 
     Goals are shuffled once with random.seed(233) inside SimServer.__init__, so the
-    index mapping is deterministic as long as file_path matches what webshop_env_server.py
+    index mapping is deterministic as long as file_path matches what server.py
     uses — otherwise goal_idx will refer to different goals at train time than at
     data-prep time.
     """

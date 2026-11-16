@@ -289,6 +289,9 @@ version = {file = "verl/version/version"}
 "" = "."
 
 [tool.setuptools.package-data]
+"scripts.alfworld" = ["*.sh", "*.yaml"]
+"scripts.sciworld" = ["*.sh", "*.yaml"]
+"scripts.webshop" = ["*.sh", "*.yaml"]
 verl = [
   "version/*",
   "trainer/config/*.yaml",

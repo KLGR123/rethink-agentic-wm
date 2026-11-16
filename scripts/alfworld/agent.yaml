@@ -1,0 +1,5 @@
+# Agent loop registration for ALFWorld GRPO training.
+# Referenced via actor_rollout_ref.rollout.agent.agent_loop_config_path
+
+- name: alfworld_agent
+  _target_: scripts.alfworld.agent_loop.ALFWorldAgentLoop

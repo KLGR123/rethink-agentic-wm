@@ -142,6 +142,7 @@ class PPOTrainer(ABC):
 
         self.trainer_mode = self.config.trainer.v1.trainer_mode
         self.parameter_sync_step = self.config.trainer.v1.get(self.trainer_mode, {}).get("parameter_sync_step", 1)
+        self._validate_grad_alignment_config()
         self.replay_buffer = self._build_replay_buffer()
         self._rollout_moe_lb_metrics_accumulator = RolloutMoELoadBalanceMetricsAccumulator(
             model_config=self.config.actor_rollout_ref.model
@@ -1309,6 +1310,26 @@ class PPOTrainer(ABC):
         self._dump_futures.clear()
         self._dump_executor.shutdown(wait=True)
 
+    def _validate_grad_alignment_config(self):
+        actor = self.config.actor_rollout_ref.actor
+        cfg = actor.get("grad_alignment", {})
+        if not cfg.get("enable", False):
+            return
+        if self.trainer_mode != "sync" or self.parameter_sync_step != 1:
+            raise ValueError("Online gradient alignment currently requires the synchronous v1 trainer")
+        if actor.strategy not in {"fsdp", "fsdp2"} or actor.fsdp_config.ulysses_sequence_parallel_size != 1:
+            raise ValueError("Online gradient alignment requires FSDP1/FSDP2 without sequence parallelism")
+        if not cfg.get("output_dir") or cfg.get("interval", 0) <= 0:
+            raise ValueError("grad_alignment needs output_dir and a positive interval")
+        if cfg.get("wm_reduction") not in {"turn-mean", "token-mean"}:
+            raise ValueError("wm_reduction must be turn-mean or token-mean")
+        model = self.config.actor_rollout_ref.model
+        has_lora = model.get("lora_rank", 0) > 0 or model.get("lora", {}).get("rank", 0) > 0 or model.get("lora_adapter_path")
+        if has_lora or is_distillation_enabled(self.config.get("distillation")):
+            raise ValueError("Alignment currently supports full-parameter PPO, without LoRA or distillation")
+        if actor.loss_agg_mode == "seq-mean-token-sum-norm" and actor.get("loss_scale_factor") is None:
+            raise ValueError("Set a fixed loss_scale_factor for seq-mean-token-sum-norm")
+
     def _log_rollout_data(self, batch: KVBatchMeta, timing_raw: dict, rollout_data_dir: str):
         """Fetch rollout data from TransferQueue and dump sorted by uid."""
         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
@@ -1870,6 +1891,24 @@ class PPOTrainer(ABC):
             "dataloader_kwargs": {"shuffle": self.config.actor_rollout_ref.actor.shuffle},
             "temperature": self.config.actor_rollout_ref.rollout.temperature,
         }
+        alignment = self.config.actor_rollout_ref.actor.get("grad_alignment", {})
+        if alignment.get("enable", False) and (self.global_steps == 1 or self.global_steps % alignment.interval == 0):
+            actor = self.config.actor_rollout_ref.actor
+            extra_info["grad_alignment"] = {
+                "step": self.global_steps,
+                "measurement_point": "before_actor_update",
+                "output_dir": alignment.output_dir,
+                "wm_reduction": alignment.wm_reduction,
+                "num_samples": sum(not tag.get("is_padding", False) for tag in batch.tags),
+                "actor_objective": "complete_configured_loss",
+                "loss_agg_mode": actor.loss_agg_mode,
+                "use_kl_loss": actor.use_kl_loss,
+                "kl_loss_coef": actor.kl_loss_coef,
+                "kl_loss_type": actor.kl_loss_type,
+                "entropy_coeff": actor.entropy_coeff,
+                "actor_temperature": self.config.actor_rollout_ref.rollout.temperature,
+                "wm_temperature": 1.0,
+            }
         batch.extra_info.update(extra_info)
 
         output: TensorDict = self.actor_rollout_wg.update_actor(batch)
@@ -1909,8 +1948,21 @@ class PPOTrainer(ABC):
         prompt_length = data["prompts"].offsets().diff()
         response_length = data["responses"].offsets().diff()
         global_token_num = (prompt_length + response_length).tolist()
-        min_global_steps = np.array([tag["min_global_steps"] for tag in batch.tags], dtype=int)[non_padding_mask]
-        max_global_steps = np.array([tag["max_global_steps"] for tag in batch.tags], dtype=int)[non_padding_mask]
+
+        # Cast after masking: padding tags are deep copies of a real tag and an
+        # agent loop that fails to stamp min/max_global_steps leaves None there,
+        # which makes np.array(..., dtype=int) raise before the mask applies.
+        # A None on a real row falls back to the current global step.
+        def _steps(tag: dict, key: str) -> int:
+            value = tag.get(key)
+            return global_steps if value is None else int(value)
+
+        min_global_steps = np.array(
+            [_steps(tag, "min_global_steps") for tag in batch.tags], dtype=int
+        )[non_padding_mask]
+        max_global_steps = np.array(
+            [_steps(tag, "max_global_steps") for tag in batch.tags], dtype=int
+        )[non_padding_mask]
 
         # Only fetch speculative decoding stats when rollout writes them.
         spec_drafts = spec_accepts = spec_verifies = None
